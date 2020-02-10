@@ -1,7 +1,22 @@
+#include <FS.h>
+#include <DNSServer.h>
+#include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>
+#include <DoubleResetDetector.h>
 #include "WavinController.h"
-#include "PrivateConfig.h"
+//#include "PrivateConfig.h"
+
+// Number of seconds after reset during which a 
+// subseqent reset will be considered a double reset.
+#define DRD_TIMEOUT 10
+
+// RTC Memory Address for the DoubleResetDetector to use
+#define DRD_ADDRESS 0
+
+DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
 // MQTT defines
 // Esp8266 MAC will be added to the device name, to ensure unique topics
@@ -20,7 +35,24 @@ const String   MQTT_SUFFIX_OUTPUT       = "/output";
 const String   MQTT_VALUE_MODE_STANDBY  = "off";
 const String   MQTT_VALUE_MODE_MANUAL   = "heat";
 
-const String   MQTT_CLIENT = "Wavin-AHC-9000-mqtt";       // mqtt client_id prefix. Will be suffixed with Esp8266 mac to make it unique
+String   MQTT_CLIENT = "Wavin-AHC-9000-mqtt";       // mqtt client_id prefix. Will be suffixed with Esp8266 mac to make it unique
+//uint16_t MQTT_PORT   = 1883;                        // mqtt port
+char MQTT_PORT[6]   = ""; 
+String   WIFI_SSID = "";         // wifi ssid
+String   WIFI_PASS = "";     // wifi password
+
+String   MQTT_SERVER = ""; // mqtt server address without port number
+String   MQTT_USER   = "";       // mqtt user. Use "" for no username
+String   MQTT_PASS   = "";       // mqtt password. Use "" for no password
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  //Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 String mqttDeviceNameWithMac;
 String mqttClientWithMac;
@@ -206,6 +238,139 @@ void publishConfiguration(uint8_t channel)
 
 void setup()
 {
+  //Serial.begin(38400);
+  //Serial.println();
+
+  //clean FS, for testing
+  //SPIFFS.format();
+
+  // WifiManager with custom parameters
+
+  //read configuration from FS json
+  //Serial.println("mounting FS...");
+  char c_MQTT_SERVER[40] = "";
+  //char c_MQTT_PORT[6] = "";
+  char c_MQTT_USER[40] = "";
+  char c_MQTT_PASS[40] = "";
+  if (SPIFFS.begin()) {
+    //Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      //Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        //Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          //Serial.println("\nparsed json");
+          
+
+          strcpy(c_MQTT_SERVER, json["mqtt_server"]);
+          strcpy(MQTT_PORT, json["mqtt_port"]);
+          strcpy(c_MQTT_USER, json["mqtt_user"]);
+          strcpy(c_MQTT_PASS, json["mqtt_pass"]);
+          MQTT_SERVER = String(c_MQTT_SERVER);
+          MQTT_USER = String(c_MQTT_USER);
+          MQTT_PASS = String(c_MQTT_PASS);
+
+        } else {
+          //Serial.println("failed to load json config");
+        }
+        configFile.close();
+      }
+    }
+  } else {
+    //Serial.println("failed to mount FS");
+  }
+  //end read
+
+  // Custom Parameters
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server",c_MQTT_SERVER, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", MQTT_PORT, 6);
+  WiFiManagerParameter custom_mqtt_user("user", "mqtt user", c_MQTT_USER, 40);
+  WiFiManagerParameter custom_mqtt_pass("pass", "mqtt pass", c_MQTT_PASS, 40);
+
+  WiFiManager wifiManager;
+
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
+  //add all your parameters here
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_user);
+  wifiManager.addParameter(&custom_mqtt_pass);
+
+  // Detect Double reset to initiate the Captive portal for configuration
+  if (drd.detectDoubleReset()) 
+    {
+      //Serial.println("Double Reset Detected");
+      wifiManager.startConfigPortal("WavinAP");
+    } 
+  else 
+  {
+    //Serial.println("No Double Reset Detected");
+    //reset settings - for testing
+    //wifiManager.resetSettings();
+
+    //fetches ssid and pass and tries to connect
+    //if it does not connect it starts an access point with the specified name
+    //here  "AutoConnectAP"
+    //and goes into a blocking loop awaiting configuration
+    if (!wifiManager.autoConnect("WavinAP")) {
+      //Serial.println("failed to connect and hit timeout");
+      delay(3000);
+      //reset and try again, or maybe put it to deep sleep
+      ESP.reset();
+      delay(5000);
+    }
+  }
+
+  //if you get here you have connected to the WiFi
+  //Serial.println("connected...yeey :)");
+
+  //read updated parameters
+  strcpy(c_MQTT_SERVER, custom_mqtt_server.getValue());
+  strcpy(MQTT_PORT, custom_mqtt_port.getValue());
+  strcpy(c_MQTT_USER, custom_mqtt_user.getValue());
+  strcpy(c_MQTT_PASS, custom_mqtt_pass.getValue());
+  MQTT_SERVER = String(c_MQTT_SERVER);
+  MQTT_USER = String(c_MQTT_USER);
+  MQTT_PASS = String(c_MQTT_PASS);
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    //Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = c_MQTT_SERVER;
+    json["mqtt_port"] = MQTT_PORT;
+    json["mqtt_user"] = c_MQTT_USER;
+    json["mqtt_pass"] = c_MQTT_PASS;
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      //Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    //end save
+  }
+
+  //Serial.println("local ip");
+  //Serial.println(WiFi.localIP());
+
+
+  //Default
   uint8_t mac[6];
   WiFi.macAddress(mac);
 
@@ -215,28 +380,36 @@ void setup()
   mqttDeviceNameWithMac = String(MQTT_DEVICE_NAME + macStr);
   mqttClientWithMac = String(MQTT_CLIENT + macStr);
 
-  mqttClient.setServer(MQTT_SERVER.c_str(), MQTT_PORT);
+  std::string s_mqtt_port = MQTT_PORT;
+  uint16_t i_mqtt_port = atoi(s_mqtt_port.c_str());
+
+  mqttClient.setServer(MQTT_SERVER.c_str(), i_mqtt_port);
   mqttClient.setCallback(mqttCallback);
+  
 }
 
 
 void loop()
 {
+  drd.stop();
+  //Serial.begin(38400);
   if (WiFi.status() != WL_CONNECTED)
   {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+    //WiFi.mode(WIFI_STA);
+    //WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
 
     if (WiFi.waitForConnectResult() != WL_CONNECTED) return;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
+    //Serial.println("Wifi OK, checking mqtt...");
     if (!mqttClient.connected())
     {
       String will = String(MQTT_PREFIX + mqttDeviceNameWithMac + MQTT_ONLINE);
       if (mqttClient.connect(mqttClientWithMac.c_str(), MQTT_USER.c_str(), MQTT_PASS.c_str(), will.c_str(), 1, true, "False") )
       {
+          //Serial.println("Connected to mqtt");
           String setpointSetTopic = String(MQTT_PREFIX + mqttDeviceNameWithMac + "/+" + MQTT_SUFFIX_SETPOINT_SET);
           mqttClient.subscribe(setpointSetTopic.c_str(), 1);
           
