@@ -1,13 +1,74 @@
+/*------------------------------------------------------------------------------
+  16/02/2020
+  Author: DKJONAS website https://github.com/dkjonas/Wavin-AHC-9000-mqtt
+  Platforms: ESP8266
+  Language: C++/Arduino
+  ------------------------------------------------------------------------------
+  Description: 
+
+  This code provides an gateway to use with a Wavin AHC-9000 Floor Heating System. 
+  The code sends data over MQTT, so you are able to use it with most Smart-Home platforms.
+  This code / system runs very good on Home Assistant https://www.home-assistant.io
+
+  ------------------------------------------------------------------------------
+  Usage:
+
+  The first time you flash this code, you will see an access point named "WavinAP".
+  Connect to this network and follow the config-portal and fill out the forms.
+  
+  For more info from here look at the docs on the mentioned repositories.
+  ------------------------------------------------------------------------------
+  Thanks to these awesome people who helped with this code:
+
+  https://github.com/heinekmadsen     
+  https://github.com/dkjonas      
+  https://github.com/paller
+
+  ------------------------------------------------------------------------------
+  License:
+  Please see attached LICENSE.txt file for details.
+  ------------------------------------------------------------------------------*/
+
 #include <FS.h>
 #include <DNSServer.h>
+#include <WiFiClient.h>
 #include <ArduinoJson.h>
-#include <ESP8266WiFi.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <WiFi.h>
 #include <PubSubClient.h>
-#include <ESP8266WebServer.h>
+#include <PubSubClientTools.h>
 #include <WiFiManager.h>
-#include <DoubleResetDetector.h>
+#include <ESP_DoubleResetDetector.h>
 #include "WavinController.h"
-//#include "PrivateConfig.h"
+#include <Ticker.h>
+#include "SPIFFS.h"
+
+
+Ticker ticker;
+
+
+/*------------------------------------------------------------------------------ 
+TICKER SETUP - USED FOR SHOWING IF ESP IS IN CONFIG MODE OR NOT
+------------------------------------------------------------------------------*/
+
+
+ 
+void tick()
+{
+  //toggle state
+  int state = digitalRead(13);  // get the current state of GPIO1 pin
+  digitalWrite(13, !state);     // set pin to the opposite state
+}
+ 
+//gets called when WiFiManager enters configuration mode
+
+  //entered config mode, make led toggle faster
+
+/*------------------------------------------------------------------------------ 
+DOUBLE RESET DETECTOR
+------------------------------------------------------------------------------*/
 
 // Number of seconds after reset during which a 
 // subseqent reset will be considered a double reset.
@@ -16,9 +77,13 @@
 // RTC Memory Address for the DoubleResetDetector to use
 #define DRD_ADDRESS 0
 
-DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
+DoubleResetDetector* drd;
 
-// MQTT defines
+bool initialConfig = false;
+/*------------------------------------------------------------------------------ 
+// MQTT / WIFI / HOSTNAME DEFINES
+------------------------------------------------------------------------------*/
+
 // Esp8266 MAC will be added to the device name, to ensure unique topics
 // Default is topics like 'heat/floorXXXXXXXXXXXX/3/target', where 3 is the output id and XXXXXXXXXXXX is the mac
 const String   MQTT_PREFIX              = "heat/";       // include tailing '/' in prefix
@@ -35,37 +100,48 @@ const String   MQTT_SUFFIX_OUTPUT       = "/output";
 const String   MQTT_VALUE_MODE_STANDBY  = "off";
 const String   MQTT_VALUE_MODE_MANUAL   = "heat";
 
-String   MQTT_CLIENT = "Wavin-AHC-9000-mqtt";       // mqtt client_id prefix. Will be suffixed with Esp8266 mac to make it unique
-//uint16_t MQTT_PORT   = 1883;                        // mqtt port
-char MQTT_PORT[6]   = ""; 
-String   WIFI_SSID = "";         // wifi ssid
-String   WIFI_PASS = "";     // wifi password
+String   MQTT_CLIENT        = "Wavin-AHC-9000-mqtt"; // mqtt client_id prefix. Will be suffixed with Esp8266 mac to make it unique
 
-String   MQTT_SERVER = ""; // mqtt server address without port number
-String   MQTT_USER   = "";       // mqtt user. Use "" for no username
-String   MQTT_PASS   = "";       // mqtt password. Use "" for no password
+char     MQTT_PORT[6]       = "1883";                // mqtt port = 1883 (Most used port)
+String   WIFI_SSID          = "";                    // wifi ssid
+String   WIFI_PASS          = "";                    // wifi password
+
+String   MQTT_SERVER        = "";                    // mqtt server address without port number
+String   MQTT_USER          = "";                    // mqtt user. Use "" for no username
+String   MQTT_PASS          = "";                    // mqtt password. Use "" for no password
+
+/*------------------------------------------------------------------------------ 
+FLAGS AND CALLBACK FOR WIFIMANAGER
+------------------------------------------------------------------------------*/
 
 //flag for saving data
-bool shouldSaveConfig = false;
+bool shouldSaveConfig = true;
 
 //callback notifying us of the need to save config
 void saveConfigCallback () {
-  //Serial.println("Should save config");
+  Serial.println("Should save config");
   shouldSaveConfig = true;
+  ticker.attach(0.6, tick);
 }
+
+/*------------------------------------------------------------------------------ 
+CONTROL OF WAVIN
+------------------------------------------------------------------------------*/
 
 String mqttDeviceNameWithMac;
 String mqttClientWithMac;
-
+char c_MQTT_CLIENT[40] = "";
+char c_MQTT_SERVER[40] = "";
+char c_MQTT_USER[40] = "";
+char c_MQTT_PASS[40] = "";
 // Operating mode is controlled by the MQTT_SUFFIX_MODE_ topic.
 // When mode is set to MQTT_VALUE_MODE_MANUAL, temperature is set to the value of MQTT_SUFFIX_SETPOINT_
 // When mode is set to MQTT_VALUE_MODE_STANDBY, the following temperature will be used
 const float STANDBY_TEMPERATURE_DEG = 5.0;
 
-const uint8_t TX_ENABLE_PIN = 5;
-const bool SWAP_SERIAL_PINS = true;
+const uint8_t TX_ENABLE_PIN = 25;
 const uint16_t RECIEVE_TIMEOUT_MS = 1000;
-WavinController wavinController(TX_ENABLE_PIN, SWAP_SERIAL_PINS, RECIEVE_TIMEOUT_MS);
+WavinController wavinController(TX_ENABLE_PIN, RECIEVE_TIMEOUT_MS);
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -236,138 +312,188 @@ void publishConfiguration(uint8_t channel)
 }
 
 
-void setup()
+void setupSpiffs()
 {
-  //Serial.begin(38400);
-  //Serial.println();
+//SPIFFS.format();
 
-  //clean FS, for testing
-  //SPIFFS.format();
+Serial.println("mounting FS...");
 
-  // WifiManager with custom parameters
+if (SPIFFS.begin())
 
-  //read configuration from FS json
-  //Serial.println("mounting FS...");
-  char c_MQTT_SERVER[40] = "";
-  //char c_MQTT_PORT[6] = "";
-  char c_MQTT_USER[40] = "";
-  char c_MQTT_PASS[40] = "";
-  if (SPIFFS.begin()) {
-    //Serial.println("mounted file system");
-    if (SPIFFS.exists("/config.json")) {
+ {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json"))
+    {
       //file exists, reading and loading
-      //Serial.println("reading config file");
+      Serial.println("reading config file");
       File configFile = SPIFFS.open("/config.json", "r");
-      if (configFile) {
-        //Serial.println("opened config file");
+      if (configFile)
+      {
+        Serial.println("opened config file");
         size_t size = configFile.size();
         // Allocate a buffer to store contents of the file.
         std::unique_ptr<char[]> buf(new char[size]);
 
         configFile.readBytes(buf.get(), size);
-        DynamicJsonBuffer jsonBuffer;
-        JsonObject& json = jsonBuffer.parseObject(buf.get());
-        json.printTo(Serial);
-        if (json.success()) {
-          //Serial.println("\nparsed json");
-          
+        //DynamicJsonBuffer jsonBuffer;
+        //JsonObject& json = jsonBuffer.parseObject(buf.get());
+        DynamicJsonDocument json(1024);
+        auto deserializeError = deserializeJson(json, buf.get());
+        //json.printTo(Serial);
+        serializeJson(json, Serial);
+        //if (json.success()) {
+        if (!deserializeError)
+        {
+          Serial.println("\nparsed json");
 
+          strcpy(c_MQTT_CLIENT, json["mqtt_client"]);
           strcpy(c_MQTT_SERVER, json["mqtt_server"]);
           strcpy(MQTT_PORT, json["mqtt_port"]);
           strcpy(c_MQTT_USER, json["mqtt_user"]);
-          strcpy(c_MQTT_PASS, json["mqtt_pass"]);
-          MQTT_SERVER = String(c_MQTT_SERVER);
-          MQTT_USER = String(c_MQTT_USER);
-          MQTT_PASS = String(c_MQTT_PASS);
-
-        } else {
-          //Serial.println("failed to load json config");
+          strcpy(c_MQTT_PASS, json["mqtt_pass"]); 
+           } else {
+          Serial.println("failed to load json config");
         }
         configFile.close();
       }
     }
   } else {
-    //Serial.println("failed to mount FS");
+    Serial.println("failed to mount FS");
+    SPIFFS.format();
   }
   //end read
-
+/*------------------------------------------------------------------------------ 
+SETUP
+------------------------------------------------------------------------------*/
+}
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println();
+  ArduinoOTA.setHostname("WAVIN-GATEWAY");
+  //set led pin as output
+  pinMode(13, OUTPUT);
+  // start ticker with 0.5 because we start in AP mode and try to connect
+  setupSpiffs();
+  //clean FS, for testing
+ //read configuration from FS json
+ 
+  
+  
+ 
+  MQTT_CLIENT = String(c_MQTT_CLIENT);
+  MQTT_SERVER = String(c_MQTT_SERVER);
+  MQTT_USER = String(c_MQTT_USER);
+  MQTT_PASS = String(c_MQTT_PASS);
+          
+  WiFiManager wm;
+  ticker.attach(0.2, tick);
+  wm.setSaveConfigCallback(saveConfigCallback);    
   // Custom Parameters
-  WiFiManagerParameter custom_mqtt_server("server", "mqtt server",c_MQTT_SERVER, 40);
-  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", MQTT_PORT, 6);
-  WiFiManagerParameter custom_mqtt_user("user", "mqtt user", c_MQTT_USER, 40);
-  WiFiManagerParameter custom_mqtt_pass("pass", "mqtt pass", c_MQTT_PASS, 40);
+  WiFiManagerParameter custom_mqtt_client("client", "SET MQTT CLIENT NAME",c_MQTT_CLIENT, 40);
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT SERVER",c_MQTT_SERVER, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "MQTT PORT", MQTT_PORT, 6);
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT USER - Leave blank if not present", c_MQTT_USER, 40);
+  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT PASS - Leave Blank if not present", c_MQTT_PASS, 40);
+  
 
-  WiFiManager wifiManager;
+  
+
+  //set callback that gets called when connecting to previous WiFi fails, and enters Access Point mode
+  //wm.setAPCallback(configModeCallback);
 
   //set config save notify callback
-  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  
   
   //add all your parameters here
-  wifiManager.addParameter(&custom_mqtt_server);
-  wifiManager.addParameter(&custom_mqtt_port);
-  wifiManager.addParameter(&custom_mqtt_user);
-  wifiManager.addParameter(&custom_mqtt_pass);
+  wm.addParameter(&custom_mqtt_client);
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_port);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_pass);
 
+  drd = new DoubleResetDetector(DRD_TIMEOUT, DRD_ADDRESS);
+
+ 
+
+  //Remove this line if you do not want to see WiFi password printed
+  
+
+ 
+  {
+    wm.setConfigPortalTimeout(60); //If no access point name has been previously entered disable timeout.
+    wm.startConfigPortal("wavinAP");
+  }
   // Detect Double reset to initiate the Captive portal for configuration
-  if (drd.detectDoubleReset()) 
+  if (drd->detectDoubleReset())  
     {
-      //Serial.println("Double Reset Detected");
-      wifiManager.startConfigPortal("WavinAP");
+      Serial.println("Double Reset Detected");
+      wm.startConfigPortal("WavinAP");
     } 
   else 
   {
-    //Serial.println("No Double Reset Detected");
-    //reset settings - for testing
-    //wifiManager.resetSettings();
-
-    //fetches ssid and pass and tries to connect
-    //if it does not connect it starts an access point with the specified name
-    //here  "AutoConnectAP"
-    //and goes into a blocking loop awaiting configuration
-    if (!wifiManager.autoConnect("WavinAP")) {
-      //Serial.println("failed to connect and hit timeout");
-      delay(3000);
+    Serial.println("No Double Reset Detected");
+    if (!wm.autoConnect("WavinAP")) {
+      Serial.println("failed to connect and hit timeout");
+      delay(5000);
       //reset and try again, or maybe put it to deep sleep
-      ESP.reset();
+      ESP.restart();
       delay(5000);
     }
+      //keep LED on
+     digitalWrite(13, HIGH); 
   }
 
   //if you get here you have connected to the WiFi
-  //Serial.println("connected...yeey :)");
-
+  Serial.println("connected...yeey :)");
+  ticker.detach(); 
+  
   //read updated parameters
+  strcpy(c_MQTT_CLIENT, custom_mqtt_client.getValue());
   strcpy(c_MQTT_SERVER, custom_mqtt_server.getValue());
   strcpy(MQTT_PORT, custom_mqtt_port.getValue());
   strcpy(c_MQTT_USER, custom_mqtt_user.getValue());
   strcpy(c_MQTT_PASS, custom_mqtt_pass.getValue());
+  
+  MQTT_CLIENT = String(c_MQTT_CLIENT);
   MQTT_SERVER = String(c_MQTT_SERVER);
   MQTT_USER = String(c_MQTT_USER);
   MQTT_PASS = String(c_MQTT_PASS);
 
   //save the custom parameters to FS
-  if (shouldSaveConfig) {
-    //Serial.println("saving config");
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
+  if (shouldSaveConfig)
+  {
+    Serial.println("saving config");
+    //DynamicJsonBuffer jsonBuffer;
+    //JsonObject& json = jsonBuffer.createObject();
+    DynamicJsonDocument json(1024);
+
+    json["mqtt_client"] = c_MQTT_CLIENT;
     json["mqtt_server"] = c_MQTT_SERVER;
     json["mqtt_port"] = MQTT_PORT;
     json["mqtt_user"] = c_MQTT_USER;
     json["mqtt_pass"] = c_MQTT_PASS;
 
     File configFile = SPIFFS.open("/config.json", "w");
-    if (!configFile) {
-      //Serial.println("failed to open config file for writing");
+    if (!configFile)
+    {
+      Serial.println("failed to open config file for writing");
     }
 
-    json.printTo(Serial);
-    json.printTo(configFile);
+    //json.printTo(Serial);
+    serializeJson(json, Serial);
+    //json.printTo(configFile);
+    serializeJson(json, configFile);
     configFile.close();
     //end save
   }
 
-  //Serial.println("local ip");
-  //Serial.println(WiFi.localIP());
+  Serial.println("local ip");
+  Serial.println(WiFi.localIP());  //SPIFFS.format();
+
+  //ESP_WiFiManager with custom parameters
+
+ 
 
 
   //Default
@@ -386,30 +512,77 @@ void setup()
   mqttClient.setServer(MQTT_SERVER.c_str(), i_mqtt_port);
   mqttClient.setCallback(mqttCallback);
   
-}
 
+ArduinoOTA.setPort(3232);
+
+   ArduinoOTA.onStart([]() {
+     String type;
+     if (ArduinoOTA.getCommand() == U_FLASH) {
+       type = "sketch";
+     } else { // SPIFFS
+       type = "filesystem";
+     }
+
+     // Print to USB instead of Wavin
+     //Serial.swap();
+
+     // NOTE: if updating FS this would be the place to unmount FS using FS.end()
+     Serial.println("Start updating " + type);
+   })
+
+     .onEnd([]() {
+     Serial.println("\nEnd");
+   })
+
+   .onProgress([](unsigned int progress, unsigned int total) {
+     Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+   })
+
+   .onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+     if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed"); 
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");  
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+       
+  });
+   ArduinoOTA.setTimeout(20000);
+   ArduinoOTA.begin();
+   Serial.println("local_ip");
+   Serial.println(WiFi.localIP());
+   Serial.println(WiFi.gatewayIP());
+   Serial.println(WiFi.subnetMask());
+ }
+
+/*------------------------------------------------------------------------------ 
+LOOP
+------------------------------------------------------------------------------*/
 
 void loop()
 {
-  drd.stop();
-  //Serial.begin(38400);
+  ArduinoOTA.handle();
+  drd->stop();
+  //MySerial.begin(38400);
   if (WiFi.status() != WL_CONNECTED)
   {
-    //WiFi.mode(WIFI_STA);
-    //WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
 
     if (WiFi.waitForConnectResult() != WL_CONNECTED) return;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
+
+     // OTA
+     ArduinoOTA.handle();
+
     //Serial.println("Wifi OK, checking mqtt...");
     if (!mqttClient.connected())
     {
       String will = String(MQTT_PREFIX + mqttDeviceNameWithMac + MQTT_ONLINE);
       if (mqttClient.connect(mqttClientWithMac.c_str(), MQTT_USER.c_str(), MQTT_PASS.c_str(), will.c_str(), 1, true, "False") )
       {
-          //Serial.println("Connected to mqtt");
+          Serial.println("Connected to mqtt");
           String setpointSetTopic = String(MQTT_PREFIX + mqttDeviceNameWithMac + "/+" + MQTT_SUFFIX_SETPOINT_SET);
           mqttClient.subscribe(setpointSetTopic.c_str(), 1);
           
@@ -526,10 +699,13 @@ void loop()
 
         // Process incomming messages and maintain connection to the server
         if(!mqttClient.loop())
+       
         {
-            return;
+        return;
+
         }
       }
     }
   }
 }
+

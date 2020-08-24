@@ -1,20 +1,23 @@
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include "WavinController.h"
+#include "HardwareSerial.h"
 
 
-WavinController::WavinController(uint8_t pin, bool swapSerialPins, uint16_t timeout_ms)
+
+
+WavinController::WavinController(uint8_t pin, uint16_t timeout_ms)
 {
   txEnablePin = pin;
-  digitalWrite(pin, LOW);
   pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
 
   recieveTimeout_ms = timeout_ms;
 
-  Serial.begin(38400);
+  Serial2.begin(38400);
 
-  if(swapSerialPins)
+  //if(swapSerialPins)
   {
-    Serial.swap();
+    //Serial.swap();
   }
 }
 
@@ -50,9 +53,9 @@ bool WavinController::recieve(uint16_t *reply, uint8_t cmdtype)
 
   while (millis() - start_time < recieveTimeout_ms)
   {
-    while (Serial.available() && n<RECIEVE_BUFFER_SIZE)
+    while (Serial2.available() && n<RECIEVE_BUFFER_SIZE)
     {
-      buffer[n] = Serial.read();
+      buffer[n] = Serial2.read();
       n++;
 
       if (n > 5 &&
@@ -80,13 +83,13 @@ bool WavinController::recieve(uint16_t *reply, uint8_t cmdtype)
 void WavinController::transmit(uint8_t *data, uint8_t lenght)
 {
   // Empty recieve buffer before sending
-  while (Serial.read() != -1);
+  while (Serial2.read() != -1);
 
   digitalWrite(txEnablePin, HIGH);
 
-  Serial.write(data, lenght);
+  Serial2.write(data, lenght);
 
-  Serial.flush(); // Wait for data to be sent
+  Serial2.flush(); // Wait for data to be sent
   delayMicroseconds(250); // Wait for last char to be transmitted
 
   digitalWrite(txEnablePin, LOW);
