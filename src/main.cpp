@@ -553,6 +553,7 @@ ArduinoOTA.setPort(3232);
    Serial.println(WiFi.localIP());
    Serial.println(WiFi.gatewayIP());
    Serial.println(WiFi.subnetMask());
+   mqttClient.setBufferSize(1024);
  }
 
 /*------------------------------------------------------------------------------ 
